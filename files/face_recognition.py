@@ -413,6 +413,15 @@ def detect_faces_internal(img):
     return FaceRecognitionResult(items=results, out_b64=out_img_base64)
 
 
+def resize_image(img):
+    height, width = img.shape[:2]
+    if height > 3000 or width > 3000:
+        scaling_factor = 3000 / max(height, width)
+        new_dimensions = (int(width * scaling_factor), int(height * scaling_factor))
+        img = cv2.resize(img, new_dimensions, interpolation=cv2.INTER_AREA)
+    return img
+
+
 @app.post("/detect_faces_b64", response_model=FaceRecognitionResult)
 async def detect_faces_b64(payload: DetectFacesRequest):
     """Endpoint to detect faces in the provided image byte array and return recognition details."""
@@ -420,6 +429,7 @@ async def detect_faces_b64(payload: DetectFacesRequest):
         image_data = base64.b64decode(payload.image)
         nparr = np.frombuffer(image_data, dtype=np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        img = resize_image(img)
         return detect_faces_internal(img)
     except Exception as e:
         traceback.print_exc()
@@ -432,6 +442,7 @@ async def detect_faces(image_file: UploadFile = File(...)):
     try:
         image_data = await image_file.read()
         img = cv2.imdecode(np.frombuffer(image_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        img = resize_image(img)
         return detect_faces_internal(img)
     except Exception as e:
         traceback.print_exc()
