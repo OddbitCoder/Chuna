@@ -1,0 +1,1 @@
+docker build -f v2.Dockerfile -t mgrcar/deepface:0.2 .
