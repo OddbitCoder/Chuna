@@ -5,4 +5,4 @@ RUN pip install uvicorn
 RUN pip install python-multipart
 
 ENTRYPOINT ["python3"]
-CMD ["/files/server.py"]
+CMD ["/files/face_recognition.py", "--tcboo"]
