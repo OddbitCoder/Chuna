@@ -4,6 +4,8 @@ import traceback
 import json
 import argparse
 
+import base64
+
 from dataclasses import dataclass
 
 from pydantic import BaseModel
@@ -38,7 +40,6 @@ parser.add_argument('--gpu-mem', type=int, default=0, help='GPU memory limit (0 
 parser.add_argument('--detector', type=str, default='yolov8', help='face detection model (ssd, dlib, mtcnn, retinaface, mediapipe, yolov8, yunet)') 
 parser.add_argument("--model", type=str, default='ArcFace', help='face recognition model (VGG-Face, Facenet, Facenet512, OpenFace, DeepFace, DeepID, ArcFace, Dlib, SFace)') 
 parser.add_argument("--db", type=str, default='/files/db', help='known faces database location')
-parser.add_argument("--out", type=str, default='/files/out', help='output location') 
 parser.add_argument("--dist", type=str, default='cosine', help='distance metric (cosine, euclidean, euclidean_l2)') 
 parser.add_argument("--greedy", action='store_true', help='greedy database search (off by default)')
 parser.add_argument("--tcboo", action='store_true', help='new matching algorithm "There Can Be Only One" (off by default; cannot be greedy)')
@@ -68,6 +69,10 @@ class FaceRecognitionItem(BaseModel):
 
 class FaceRecognitionResult(BaseModel):
     items: List[FaceRecognitionItem]
+    out_b64: str
+
+class DetectFacesRequest(BaseModel):
+    image: str
 
 
 def init(the_app):
@@ -88,7 +93,6 @@ def init(the_app):
     # set "globals"
     the_app.model_name = model_name
     the_app.db_dir = db_dir
-    the_app.out_dir = opt.out
     the_app.distance_metric = distance_metric
     the_app.greedy_search = greedy_search
     the_app.detector_name = detector_name
@@ -269,149 +273,166 @@ class KnownFace:
     distance: float
 
 
+def detect_faces_internal(img):
+    # detect faces
+    img_objs = extract_faces(img) 
+    # embed faces
+    results = []
+    tabu = set()
+    if not app.tcboo:
+        for img_content, img_region, _ in img_objs:
+            vec = represent(
+                img_data=img_content
+            )
+            vec = vec[0]["embedding"]
+            min_dist = 1
+            best_match = None
+            # find matching faces
+            for person_fn in os.listdir(app.db_dir):
+                if person_fn in tabu:
+                    continue # for person_fn
+                for img_fn in os.listdir(os.path.join(app.db_dir, person_fn)):
+                    if not img_fn.lower().endswith(".vec") and not img_fn.lower().endswith(".err"):
+                        vec2 = represent_known(os.path.join(app.db_dir, person_fn, img_fn))
+                        if (vec2 != None):
+                            print(f"Comparing with {person_fn} ({img_fn})...")
+                            if app.distance_metric == "cosine":
+                                distance = dst.findCosineDistance(vec, vec2)
+                            elif app.distance_metric == "euclidean_l2":
+                                distance = dst.findEuclideanDistance(dst.l2_normalize(vec), dst.l2_normalize(vec2))
+                            else: # euclidean
+                                distance = dst.findEuclideanDistance(vec, vec2)
+                            threshold = dst.findThreshold(app.model_name, app.distance_metric)
+                            if distance < min_dist:
+                                min_dist = distance
+                                best_match = FaceRecognitionItem(
+                                    x=img_region['x'],
+                                    y=img_region['y'],
+                                    width=img_region['w'],
+                                    height=img_region['h'],
+                                    id=person_fn,
+                                    distance=distance,
+                                    threshold=threshold,
+                                    verified=bool(distance <= threshold)
+                                )
+                                if distance <= threshold and app.greedy_search:
+                                    break # for img_fn 
+                # for each person_fn continue here...
+            # for each embedding continue here...
+            if best_match != None:
+                results.append(best_match)
+                if app.greedy_search and best_match.verified:
+                    # put best_match to tabu list
+                    tabu.add(best_match.id)
+    else:  # ***** NEW MATCHING ALGORITHM *****
+        threshold = dst.findThreshold(app.model_name, app.distance_metric)
+        recognition_objects = []
+        
+        for img_content, img_region, _ in img_objs:
+            vec = represent(
+                img_data=img_content
+            )
+            recognition_objects.append(RecognitionObject(
+                vec=vec[0]["embedding"],
+                x=img_region['x'],
+                y=img_region['y'],
+                width=img_region['w'],
+                height=img_region['h']
+            ))
+
+        for recognition_obj in recognition_objects:
+            known_faces = []
+            for folder in os.listdir(app.db_dir):
+                min_distance = float('inf')
+                for image_path in os.listdir(os.path.join(app.db_dir, folder)):
+                    if image_path.lower().endswith(".vec") or image_path.lower().endswith(".err"):
+                        continue
+                    vec2 = represent_known(os.path.join(app.db_dir, folder, image_path))
+                    distance = float('inf')
+                    if (vec2 != None):
+                        print(f"Comparing with {folder} ({image_path})...")
+                        if app.distance_metric == "cosine":
+                            distance = dst.findCosineDistance(recognition_obj.vec, vec2)
+                        elif app.distance_metric == "euclidean_l2":
+                            distance = dst.findEuclideanDistance(dst.l2_normalize(recognition_obj.vec), dst.l2_normalize(vec2))
+                        else: # euclidean
+                            distance = dst.findEuclideanDistance(recognition_obj.vec, vec2)
+                        threshold = dst.findThreshold(app.model_name, app.distance_metric)
+                    if distance < min_distance:
+                        min_distance = distance
+                # here we have min_distance for current folder
+                known_face = KnownFace(folder=folder, distance=min_distance)
+                known_faces.append(known_face)
+            
+            recognition_obj.known_faces = sorted(known_faces, key=lambda kf: kf.distance)    
+            
+        while recognition_objects:
+            min_known_face = None
+            min_recognition_obj = None
+            for recognition_obj in recognition_objects:
+                if recognition_obj.known_faces:  # ensure there are known_faces to compare
+                    first_known_face = recognition_obj.known_faces[0]
+                    if min_known_face is None or first_known_face.distance < min_known_face.distance:
+                        min_known_face = first_known_face
+                        min_recognition_obj = recognition_obj
+            if min_known_face is None:
+                break
+            results.append(FaceRecognitionItem(
+                x=min_recognition_obj.x,
+                y=min_recognition_obj.y,
+                width=min_recognition_obj.width,
+                height=min_recognition_obj.height,
+                id=min_known_face.folder,
+                distance=min_known_face.distance,
+                threshold=threshold,
+                verified=bool(min_known_face.distance <= threshold)
+            ))
+            recognition_objects.remove(min_recognition_obj)
+            for rec_obj in recognition_objects:
+                # filter out the known_face associated with the selected folder from remaining lists
+                rec_obj.known_faces = [kf for kf in rec_obj.known_faces if kf.folder != min_known_face.folder]
+        
+        for recognition_obj in recognition_objects:
+            results.append(FaceRecognitionItem(
+                x=recognition_obj.x,
+                y=recognition_obj.y,
+                width=recognition_obj.width,
+                height=recognition_obj.height,
+                id="",
+                distance=-1,
+                threshold=threshold,
+                verified=False
+            ))
+
+    for item in results:
+       color = (0, 255, 0) if item.verified else (0, 0, 255)
+       cv2.rectangle(img, (item.x, item.y), (item.x + item.width, item.y + item.height), color=color, thickness=5)
+    #cv2.imwrite(os.path.join(app.db_dir, "test.jpg"), img) # WARNME
+    _, buffer = cv2.imencode('.jpg', img)
+    out_img_base64 = base64.b64encode(buffer).decode('utf-8')
+    return FaceRecognitionResult(items=results, out_b64=out_img_base64)
+
+
+@app.post("/detect_faces_b64", response_model=FaceRecognitionResult)
+async def detect_faces_b64(payload: DetectFacesRequest):
+    """Endpoint to detect faces in the provided image byte array and return recognition details."""
+    try:
+        image_data = base64.b64decode(payload.image)
+        nparr = np.frombuffer(image_data, dtype=np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        return detect_faces_internal(img)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/detect_faces", response_model=FaceRecognitionResult)
 async def detect_faces(image_file: UploadFile = File(...)):
     """Endpoint to detect faces in the provided image byte array and return recognition details."""
     try:
         image_data = await image_file.read()
         img = cv2.imdecode(np.frombuffer(image_data, dtype=np.uint8), cv2.IMREAD_COLOR)
-        # detect faces
-        img_objs = extract_faces(img) 
-        # we don't need img here anymore, so we can draw stuff on it :)
-        # embed faces
-        results = []
-        tabu = set()
-        if not app.tcboo:
-            for img_content, img_region, _ in img_objs:
-                vec = represent(
-                    img_data=img_content
-                )
-                vec = vec[0]["embedding"]
-                min_dist = 1
-                best_match = None
-                # find matching faces
-                for person_fn in os.listdir(app.db_dir):
-                    if person_fn in tabu:
-                        continue # for person_fn
-                    for img_fn in os.listdir(os.path.join(app.db_dir, person_fn)):
-                        if not img_fn.lower().endswith(".vec") and not img_fn.lower().endswith(".err"):
-                            vec2 = represent_known(os.path.join(app.db_dir, person_fn, img_fn))
-                            if (vec2 != None):
-                                print(f"Comparing with {person_fn} ({img_fn})...")
-                                if app.distance_metric == "cosine":
-                                    distance = dst.findCosineDistance(vec, vec2)
-                                elif app.distance_metric == "euclidean_l2":
-                                    distance = dst.findEuclideanDistance(dst.l2_normalize(vec), dst.l2_normalize(vec2))
-                                else: # euclidean
-                                    distance = dst.findEuclideanDistance(vec, vec2)
-                                threshold = dst.findThreshold(app.model_name, app.distance_metric)
-                                if distance < min_dist:
-                                    min_dist = distance
-                                    best_match = FaceRecognitionItem(
-                                        x=img_region['x'],
-                                        y=img_region['y'],
-                                        width=img_region['w'],
-                                        height=img_region['h'],
-                                        id=person_fn,
-                                        distance=distance,
-                                        threshold=threshold,
-                                        verified=bool(distance <= threshold)
-                                    )
-                                    if distance <= threshold and app.greedy_search:
-                                        break # for img_fn 
-                    # for each person_fn continue here...
-                # for each embedding continue here...
-                if best_match != None:
-                    results.append(best_match)
-                    if app.greedy_search and best_match.verified:
-                        # put best_match to tabu list
-                        tabu.add(best_match.id)
-        else:  # ***** NEW MATCHING ALGORITHM *****
-            threshold = dst.findThreshold(app.model_name, app.distance_metric)
-            recognition_objects = []
-            
-            for img_content, img_region, _ in img_objs:
-                vec = represent(
-                    img_data=img_content
-                )
-                recognition_objects.append(RecognitionObject(
-                    vec=vec[0]["embedding"],
-                    x=img_region['x'],
-                    y=img_region['y'],
-                    width=img_region['w'],
-                    height=img_region['h']
-                ))
-
-            for recognition_obj in recognition_objects:
-                known_faces = []
-                for folder in os.listdir(app.db_dir):
-                    min_distance = float('inf')
-                    for image_path in os.listdir(os.path.join(app.db_dir, folder)):
-                        if image_path.lower().endswith(".vec") or image_path.lower().endswith(".err"):
-                            continue
-                        vec2 = represent_known(os.path.join(app.db_dir, folder, image_path))
-                        distance = float('inf')
-                        if (vec2 != None):
-                            print(f"Comparing with {folder} ({image_path})...")
-                            if app.distance_metric == "cosine":
-                                distance = dst.findCosineDistance(recognition_obj.vec, vec2)
-                            elif app.distance_metric == "euclidean_l2":
-                                distance = dst.findEuclideanDistance(dst.l2_normalize(recognition_obj.vec), dst.l2_normalize(vec2))
-                            else: # euclidean
-                                distance = dst.findEuclideanDistance(recognition_obj.vec, vec2)
-                            threshold = dst.findThreshold(app.model_name, app.distance_metric)
-                        if distance < min_distance:
-                            min_distance = distance
-                    # here we have min_distance for current folder
-                    known_face = KnownFace(folder=folder, distance=min_distance)
-                    known_faces.append(known_face)
-                
-                recognition_obj.known_faces = sorted(known_faces, key=lambda kf: kf.distance)    
-                
-            while recognition_objects:
-                min_known_face = None
-                min_recognition_obj = None
-                for recognition_obj in recognition_objects:
-                    if recognition_obj.known_faces:  # ensure there are known_faces to compare
-                        first_known_face = recognition_obj.known_faces[0]
-                        if min_known_face is None or first_known_face.distance < min_known_face.distance:
-                            min_known_face = first_known_face
-                            min_recognition_obj = recognition_obj
-                if min_known_face is None:
-                    break
-                results.append(FaceRecognitionItem(
-                    x=recognition_obj.x,
-                    y=recognition_obj.y,
-                    width=recognition_obj.width,
-                    height=recognition_obj.height,
-                    id=min_known_face.folder,
-                    distance=min_known_face.distance,
-                    threshold=threshold,
-                    verified=bool(min_known_face.distance <= threshold)
-                ))
-                recognition_objects.remove(min_recognition_obj)
-                for rec_obj in recognition_objects:
-                    # filter out the known_face associated with the selected folder from remaining lists
-                    rec_obj.known_faces = [kf for kf in rec_obj.known_faces if kf.folder != min_known_face.folder]
-            
-            for recognition_obj in recognition_objects:
-                results.append(FaceRecognitionItem(
-                    x=recognition_obj.x,
-                    y=recognition_obj.y,
-                    width=recognition_obj.width,
-                    height=recognition_obj.height,
-                    id="",
-                    distance=-1,
-                    threshold=threshold,
-                    verified=False
-                ))
-
-        # for debugging: annotate and save img
-        #for item in results:
-        #    color = (0, 255, 0) if item.verified else (0, 0, 255)
-        #    cv2.rectangle(img, (item.x, item.y), (item.x + item.width, item.y + item.height), color=color, thickness=5)
-        #cv2.imwrite(os.path.join(app.db_dir, "test.jpg"), img) # WARNME
-        return FaceRecognitionResult(items=results)
+        return detect_faces_internal(img)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))   
