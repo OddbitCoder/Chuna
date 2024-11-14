@@ -66,6 +66,9 @@ class FaceRecognitionItem(BaseModel):
 class FaceRecognitionResultForAgg(BaseModel):
   items: List[FaceRecognitionItem]
 
+class FaceRecognitionAll(BaseModel):
+  recognition_results: List[FaceRecognitionResultForAgg]
+
 class AggregatePeopleResult(BaseModel):
   verified: List[str]
   unverified: List[str]
@@ -233,12 +236,12 @@ all_users = [
     "Žiga Povalej"
 ]
 
-def aggregate_recogniction_lists(results_list):
+def aggregate_recognition_lists(results_list):
   unmatched_faces = []
   verified_users = []
   verified_users_final = []
   suggestion_list = []
-  for faceDict in results_list:
+  for faceDict in results_list.recognition_results:
     for user_recognition in faceDict.items:
       print(user_recognition.verified)
       verified = user_recognition.verified
@@ -259,16 +262,18 @@ def aggregate_recogniction_lists(results_list):
   return verified_users_final, suggestion_list, other_users
 
 @app.post("/aggregate_face_results", response_model=AggregatePeopleResult)
-async def aggregate_face_results(payload: List[FaceRecognitionResultForAgg]):
+async def aggregate_face_results(payload: FaceRecognitionAll):
   """Aggregate results."""
-  print(payload)
-  verified_users, suggestion_list, other_users = aggregate_recogniction_lists(payload)
+  verified_users, suggestion_list, other_users = aggregate_recognition_lists(payload)
   response = AggregatePeopleResult(
     verified=verified_users,
     unverified = suggestion_list,
     other = other_users
   )
   return response
+
+# def expand_invoices(parsed_invoice):
+
 
 # @app.post("/expand_invoice_items", response_model=ExpandedInvoice)
 # async def aggregate_face_results(payload: ParsedInvoice):
