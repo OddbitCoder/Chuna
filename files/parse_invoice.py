@@ -55,7 +55,7 @@ async def parse_invoice(invoice_image: UploadFile = File(...)):
       messages=[
         {
           "role": "system",
-          "content": "Parse the given invoice",
+          "content": "Parse the given invoice. Make sure that the sum of all items is the same as the total.",
         },
         {
           "role": "user",

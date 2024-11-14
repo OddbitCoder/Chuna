@@ -1,0 +1,17 @@
+services:
+  deepface:
+    image: mgrcar/deepface:0.2
+    build: .
+    volumes:
+      - ./files:/files
+      - ./models:/root/.deepface/weights
+      - ./tmp:/tmp
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "8000:8000"
