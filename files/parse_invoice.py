@@ -1,3 +1,4 @@
+from enum import Enum
 from pydantic import BaseModel
 from openai import OpenAI
 import base64
@@ -12,6 +13,7 @@ import uvicorn
 parser = argparse.ArgumentParser()
 parser.add_argument('--key', type=str, default=os.getenv('OPENAI_KEY'), help='OpenAI key')
 parser.add_argument('--port', type=int, default=8000, help='Server port')
+parser.add_argument('--host', type=str, default="0.0.0.0", help='Server host')
 
 opt = parser.parse_args()
 
@@ -37,46 +39,125 @@ class ParsedInvoice(BaseModel):
   total: float
   items: list[InvoiceItem]
 
+class Category(str, Enum):
+    PEOPLE = "PEOPLE"
+    INVOICE = "INVOICE"
+    BOTH = "BOTH"  
+
+class CategorizerResult(BaseModel):
+  category: Category
+
+
+def categorize_image_internal(base64_image):
+  client = OpenAI(api_key=app.api_key)
+
+  response = client.beta.chat.completions.parse(
+    model="gpt-4o",
+    response_format=CategorizerResult,
+    messages=[
+      {
+        "role": "system",
+        "content": "Categorize the given image into either PEOPLE, INVOICE or BOTH, depending on what the image contains.",
+      },
+      {
+        "role": "user",
+        "content": 
+        [{
+            "type": "image_url",
+            "image_url": 
+            {
+              "url": f"data:image/jpeg;base64,{base64_image}"
+            }
+        }]
+      }
+    ],
+  )
+
+  return response.choices[0].message.parsed
+
+
+def parse_invoice_internal(base64_image):
+  client = OpenAI(api_key=app.api_key)
+
+  response = client.beta.chat.completions.parse(
+    model="gpt-4o",
+    response_format=ParsedInvoice,
+    messages=[
+      {
+        "role": "system",
+        "content": "Parse the given invoice.",
+      },
+      {
+        "role": "user",
+        "content": 
+        [{
+            "type": "image_url",
+            "image_url": 
+            {
+              "url": f"data:image/jpeg;base64,{base64_image}"
+            }
+        }]
+      }
+    ],
+  )
+
+  return response.choices[0].message.parsed
+
+
+class InvoiceImageRequest(BaseModel):
+    invoice_image: str
+
+class CategorizeImageRequest(BaseModel):
+    image: str
+
 
 @app.post("/parse_invoice", response_model=ParsedInvoice)
 async def parse_invoice(invoice_image: UploadFile = File(...)):
   """Parses the given invoice."""
   try:
-    client = OpenAI(api_key=app.api_key)
-
     image_data = await invoice_image.read()
-    #img = cv2.imdecode(np.frombuffer(image_data, dtype=np.uint8), cv2.IMREAD_COLOR)
 
     base64_image = base64.b64encode(image_data).decode('utf-8')
 
-    response = client.beta.chat.completions.parse(
-      model="gpt-4o",
-      response_format=ParsedInvoice,
-      messages=[
-        {
-          "role": "system",
-          "content": "Parse the given invoice. Make sure that the sum of all items is the same as the total.",
-        },
-        {
-          "role": "user",
-          "content": 
-          [{
-              "type": "image_url",
-              "image_url": 
-              {
-                "url": f"data:image/jpeg;base64,{base64_image}"
-              }
-          }]
-        }
-      ],
-    )
-
-    return response.choices[0].message.parsed
+    return parse_invoice_internal(base64_image)
 
   except Exception as e:
-    # traceback.print_exc()
+    raise HTTPException(status_code=500, detail=str(e))   
+
+@app.post("/parse_invoice_b64", response_model=ParsedInvoice)
+async def parse_invoice_b64(payload: InvoiceImageRequest):
+  """Parses the given invoice."""
+  invoice_image = payload.invoice_image
+  try:
+    return parse_invoice_internal(invoice_image)
+
+  except Exception as e:
     raise HTTPException(status_code=500, detail=str(e))   
 
 
+@app.post("/categorize_image", response_model=CategorizerResult)
+async def parse_invoice(image: UploadFile = File(...)):
+  """Categorizes the given image."""
+  try:
+    image_data = await image.read()
+
+    base64_image = base64.b64encode(image_data).decode('utf-8')
+
+    return categorize_image_internal(base64_image)
+
+  except Exception as e:
+    raise HTTPException(status_code=500, detail=str(e))   
+
+@app.post("/categorize_image_b64", response_model=CategorizerResult)
+async def parse_invoice_b64(payload: CategorizeImageRequest):
+  """Categorizes the given image."""
+  image = payload.image
+  try:
+    return categorize_image_internal(image)
+
+  except Exception as e:
+    raise HTTPException(status_code=500, detail=str(e)) 
+
+
 if __name__ == '__main__':
-  uvicorn.run(app, host="127.0.0.1", port=opt.port)
+  uvicorn.run(app, host=opt.host, port=opt.port)
